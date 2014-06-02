@@ -92,6 +92,7 @@ public class CouchdbRiver extends AbstractRiverComponent implements River {
     private final int throttleSize;
 
     private final ExecutableScript script;
+    private final ExecutableScript scriptView;
 
     private volatile Thread slurperThread;
     private volatile Thread indexerThread;
@@ -156,6 +157,17 @@ public class CouchdbRiver extends AbstractRiverComponent implements River {
             } else {
                 script = null;
             }
+
+            if (couchSettings.containsKey("script_view")) {
+                String scriptType = "js";
+                if(couchSettings.containsKey("script_view_type")) {
+                    scriptType = couchSettings.get("script_view_type").toString();
+                }
+
+                scriptView = scriptService.executable(scriptType, couchSettings.get("script_view").toString(), Maps.newHashMap());
+            } else {
+                scriptView = null;
+            }
         } else {
             couchProtocol = "http";
             couchHost = "localhost";
@@ -172,6 +184,7 @@ public class CouchdbRiver extends AbstractRiverComponent implements River {
             noVerify = false;
             basicAuth = null;
             script = null;
+            scriptView = null;
         }
 
         if (settings.settings().containsKey("index")) {
@@ -318,27 +331,38 @@ public class CouchdbRiver extends AbstractRiverComponent implements River {
         doDeleteFromView(getViewRows(id), index, type, id, routing);
     }
 
-    private void processingView(String index, String type, String id, String routing, String parent) {
+    private void processingView(String index, String type, String id, String routing) {
         List<Object> rows = getViewRows(id);
 
         doDeleteFromView(rows, index, type, id, routing);
 
-        int rownum = 1;
-        for (Iterator<Object> it = rows.iterator(); it.hasNext(); ) {
-            Object object = it.next();
-            if ((object instanceof Map)) {
-                Map<String, Object> row = (Map<String, Object>) object;
-                Map<String, Object> value = getMapFromJsonNode(row, "value");
-                if (value != null) {
-                    if (this.logger.isTraceEnabled()) {
-                        this.logger.trace("row found {}",
-                                new Object[]{value});
-                    }
-                    bulkProcessor.add(new IndexRequest(index, type, new StringBuilder().append(id).append("_").append(rownum++).toString())
-                            .source(value)
-                            .routing(routing)
-                            .parent(parent));
+        if (!rows.isEmpty()) {
+            Map<String, Object> row = (Map<String, Object>) rows.get(0);
+            Map<String, Object> value = getMapFromJsonNode(row, "value");
+            if (value != null) {
+                if (this.logger.isTraceEnabled()) {
+                    this.logger.trace("row found {}", new Object[]{value});
                 }
+                if (scriptView != null) {
+                    scriptView.setNextVar("view", value);
+                    try {
+                        scriptView.run();
+                        // we need to unwrap the ctx...
+                        value = (Map<String, Object>) scriptView.unwrap(value);
+                    } catch (Exception e) {
+                        logger.warn("failed to scriptView process {}, ignoring", e, value);
+                    }
+                }
+
+                String parent = extractParent(value);
+                if (this.logger.isTraceEnabled()) {
+                    this.logger.trace("indexing view result [{}] [{}] [{}] [{}]: {}", index, type, id, parent, value);
+                }
+
+                bulkProcessor.add(new IndexRequest(index, type, id)
+                        .source(value)
+                        .routing(routing)
+                        .parent(parent));
             }
         }
     }
@@ -401,6 +425,9 @@ public class CouchdbRiver extends AbstractRiverComponent implements River {
 
         if (ctx.containsKey("ignore") && ctx.get("ignore").equals(Boolean.TRUE)) {
             // ignore dock
+            if (logger.isTraceEnabled()) {
+                logger.trace("ignoring document {}", ctx);
+            }
         } else if (ctx.containsKey("deleted") && ctx.get("deleted").equals(Boolean.TRUE)) {
             String index = extractIndex(ctx);
             String type = extractType(ctx);
@@ -446,7 +473,7 @@ public class CouchdbRiver extends AbstractRiverComponent implements River {
                 }
 
                 if (id != null) {
-                    processingView(index, type, id, extractRouting(ctx), extractParent(ctx));
+                    processingView(index, type, id, extractRouting(ctx));
                 }
             }
         }
@@ -647,7 +674,7 @@ public class CouchdbRiver extends AbstractRiverComponent implements River {
                 try {
                     client.admin().indices().prepareRefresh(riverIndexName).execute().actionGet();
                     GetResponse lastSeqGetResponse = client.prepareGet(riverIndexName, riverName().name(), "_seq").execute().actionGet();
-                    logger.trace("[couchdb] read last seq: " + lastSeqGetResponse);
+
                     if (lastSeqGetResponse.isExists()) {
                         Map<String, Object> couchdbState = (Map<String, Object>) lastSeqGetResponse.getSourceAsMap().get("couchdb");
                         if (couchdbState != null) {
